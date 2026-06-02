@@ -14,6 +14,8 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
+from xgboost import XGBRegressor
+
 from config import (
     CURRENT_PRICE_COLUMNS,
     DATASET_PATHS,
@@ -62,7 +64,7 @@ def clean_feature_list(df: pd.DataFrame, features: list[str]) -> list[str]:
         if col not in numeric_cols:
             continue
 
-        if col in ["date"]:
+        if col == "date":
             continue
 
         if any(keyword in col for keyword in leak_keywords):
@@ -108,6 +110,16 @@ def make_models() -> dict:
             random_state=42,
             n_jobs=-1,
         ),
+        "xgboost": XGBRegressor(
+            n_estimators=500,
+            max_depth=3,
+            learning_rate=0.03,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            objective="reg:squarederror",
+            random_state=42,
+            n_jobs=-1,
+        ),
     }
 
 
@@ -133,6 +145,20 @@ def make_xy(df: pd.DataFrame, feature_cols: list[str]):
     return X, y
 
 
+def mae_or_nan(actual: np.ndarray, pred: np.ndarray, mask: np.ndarray) -> float:
+    if mask.sum() == 0:
+        return float("nan")
+
+    return float(mean_absolute_error(actual[mask], pred[mask]))
+
+
+def rmse_or_nan(actual: np.ndarray, pred: np.ndarray, mask: np.ndarray) -> float:
+    if mask.sum() == 0:
+        return float("nan")
+
+    return float(mean_squared_error(actual[mask], pred[mask]) ** 0.5)
+
+
 def evaluate_prediction(
     df: pd.DataFrame,
     pred_change: np.ndarray,
@@ -147,7 +173,14 @@ def evaluate_prediction(
 
     abs_error = np.abs(actual_future_price - predicted_future_price)
 
+    normal_mask = np.abs(y_true_change) <= 10
+    shock_10_mask = np.abs(y_true_change) > 10
+    shock_20_mask = np.abs(y_true_change) > 20
+    up_mask = y_true_change > 0
+    down_mask = y_true_change < 0
+
     return {
+        # 전체 성능
         "change_mae": float(mean_absolute_error(y_true_change, pred_change)),
         "change_rmse": float(mean_squared_error(y_true_change, pred_change) ** 0.5),
         "change_r2": float(r2_score(y_true_change, pred_change)),
@@ -168,8 +201,49 @@ def evaluate_prediction(
         "within_3_pct": float((abs_error <= 3).mean() * 100),
         "within_5_pct": float((abs_error <= 5).mean() * 100),
         "within_10_pct": float((abs_error <= 10).mean() * 100),
-        "actual_change_abs_gt_10_rows": int((np.abs(y_true_change) > 10).sum()),
-        "actual_change_abs_gt_20_rows": int((np.abs(y_true_change) > 20).sum()),
+        # 구간별 행 수
+        "normal_abs_change_le_10_rows": int(normal_mask.sum()),
+        "shock_abs_change_gt_10_rows": int(shock_10_mask.sum()),
+        "shock_abs_change_gt_20_rows": int(shock_20_mask.sum()),
+        "up_change_rows": int(up_mask.sum()),
+        "down_change_rows": int(down_mask.sum()),
+        # 구간별 MAE
+        "normal_abs_change_le_10_mae": mae_or_nan(
+            actual_future_price,
+            predicted_future_price,
+            normal_mask,
+        ),
+        "shock_abs_change_gt_10_mae": mae_or_nan(
+            actual_future_price,
+            predicted_future_price,
+            shock_10_mask,
+        ),
+        "shock_abs_change_gt_20_mae": mae_or_nan(
+            actual_future_price,
+            predicted_future_price,
+            shock_20_mask,
+        ),
+        "up_change_mae": mae_or_nan(
+            actual_future_price,
+            predicted_future_price,
+            up_mask,
+        ),
+        "down_change_mae": mae_or_nan(
+            actual_future_price,
+            predicted_future_price,
+            down_mask,
+        ),
+        # 구간별 RMSE
+        "normal_abs_change_le_10_rmse": rmse_or_nan(
+            actual_future_price,
+            predicted_future_price,
+            normal_mask,
+        ),
+        "shock_abs_change_gt_20_rmse": rmse_or_nan(
+            actual_future_price,
+            predicted_future_price,
+            shock_20_mask,
+        ),
     }
 
 
@@ -288,12 +362,18 @@ def main():
                 "test_within_3_pct": test_metrics["within_3_pct"],
                 "test_within_5_pct": test_metrics["within_5_pct"],
                 "test_within_10_pct": test_metrics["within_10_pct"],
-                "test_actual_change_abs_gt_10_rows": test_metrics[
-                    "actual_change_abs_gt_10_rows"
-                ],
-                "test_actual_change_abs_gt_20_rows": test_metrics[
-                    "actual_change_abs_gt_20_rows"
-                ],
+                "test_normal_rows": test_metrics["normal_abs_change_le_10_rows"],
+                "test_shock_gt_10_rows": test_metrics["shock_abs_change_gt_10_rows"],
+                "test_shock_gt_20_rows": test_metrics["shock_abs_change_gt_20_rows"],
+                "test_up_rows": test_metrics["up_change_rows"],
+                "test_down_rows": test_metrics["down_change_rows"],
+                "test_normal_mae": test_metrics["normal_abs_change_le_10_mae"],
+                "test_shock_gt_10_mae": test_metrics["shock_abs_change_gt_10_mae"],
+                "test_shock_gt_20_mae": test_metrics["shock_abs_change_gt_20_mae"],
+                "test_up_mae": test_metrics["up_change_mae"],
+                "test_down_mae": test_metrics["down_change_mae"],
+                "test_normal_rmse": test_metrics["normal_abs_change_le_10_rmse"],
+                "test_shock_gt_20_rmse": test_metrics["shock_abs_change_gt_20_rmse"],
             }
 
             results.append(row)
@@ -302,9 +382,10 @@ def main():
                 f"{model_name:14s} | "
                 f"VAL MAE={val_metrics['price_mae']:.6f} | "
                 f"TEST MAE={test_metrics['price_mae']:.6f} | "
-                f"TEST RMSE={test_metrics['price_rmse']:.6f} | "
-                f"TEST R2={test_metrics['change_r2']:.6f} | "
-                f"TEST <=5$={test_metrics['within_5_pct']:.2f}%"
+                f"NORMAL MAE={test_metrics['normal_abs_change_le_10_mae']:.6f} | "
+                f"SHOCK>20 MAE={test_metrics['shock_abs_change_gt_20_mae']:.6f} | "
+                f"MEDIAN={test_metrics['median_abs_error']:.6f} | "
+                f"<=5$={test_metrics['within_5_pct']:.2f}%"
             )
 
     result_df = pd.DataFrame(results)
@@ -334,6 +415,10 @@ def main():
         "test_max_abs_error",
         "test_within_5_pct",
         "test_within_10_pct",
+        "test_normal_rows",
+        "test_shock_gt_20_rows",
+        "test_normal_mae",
+        "test_shock_gt_20_mae",
         "test_change_r2",
     ]
 
@@ -348,6 +433,10 @@ def main():
     print("test_price_mae:", best["test_price_mae"])
     print("test_price_rmse:", best["test_price_rmse"])
     print("baseline_price_mae:", best["test_baseline_price_mae"])
+    print("test_normal_mae:", best["test_normal_mae"])
+    print("test_shock_gt_20_mae:", best["test_shock_gt_20_mae"])
+    print("test_median_abs_error:", best["test_median_abs_error"])
+    print("test_max_abs_error:", best["test_max_abs_error"])
     print("model_path:", best["model_path"])
 
     print("\n저장 완료:")

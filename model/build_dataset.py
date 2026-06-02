@@ -84,15 +84,12 @@ def parse_oil_date(series: pd.Series) -> pd.Series:
     """
     parsed = pd.to_datetime(series, errors="coerce")
 
-    # 정상 파싱이 대부분 성공하면 그대로 사용
     if parsed.notna().sum() > len(series) * 0.8:
         return parsed.dt.floor("D").astype("datetime64[ns]")
 
     def convert_one(value):
         digits = re.sub(r"\D", "", str(value))
 
-        # 예상 형태: YYMMDD
-        # 예: 180102 -> 2018-01-02
         if len(digits) >= 6:
             digits = digits[:6]
 
@@ -110,6 +107,7 @@ def parse_oil_date(series: pd.Series) -> pd.Series:
         return pd.NaT
 
     result = series.apply(convert_one)
+
     return (
         pd.to_datetime(result, errors="coerce").dt.floor("D").astype("datetime64[ns]")
     )
@@ -140,9 +138,7 @@ def clean_daily_value_df(
 
     result[output_col] = result[output_col].ffill().bfill()
 
-    print(
-        f"[{output_col}] 날짜 파싱 전/후 행 수: " f"{before_rows} -> {after_date_rows}"
-    )
+    print(f"[{output_col}] 날짜 파싱 전/후 행 수: {before_rows} -> {after_date_rows}")
 
     return result
 
@@ -179,7 +175,6 @@ def load_oil_price() -> pd.DataFrame:
     result = df.rename(columns=rename_map)
     result = result[["date", "current_Dubai", "current_Brent", "current_WTI"]].copy()
 
-    # oil_price_daily.csv의 깨진 날짜 복원
     result["date"] = parse_oil_date(result["date"])
 
     for col in ["current_Dubai", "current_Brent", "current_WTI"]:
@@ -187,43 +182,49 @@ def load_oil_price() -> pd.DataFrame:
 
     before_rows = len(result)
 
-    # 1. 날짜가 복원되지 않은 행 삭제
     result = result.dropna(subset=["date"])
     after_date_rows = len(result)
 
-    # 2. 세 유종 가격 중 하나라도 없는 행 삭제
-    price_cols = ["current_Dubai", "current_Brent", "current_WTI"]
-
-    before_price_rows = len(result)
-    result = result.dropna(subset=price_cols)
-    after_price_rows = len(result)
-
-    # 3. 날짜 정렬 및 중복 제거
     result = result.sort_values("date")
     result = result.drop_duplicates(subset=["date"], keep="last")
     result = result.reset_index(drop=True)
 
-    # 4. 가격이 모두 존재하는 거래일 기준으로 10거래일 뒤 가격 생성
+    # 핵심:
+    # 각 유종별로 "자기 가격이 존재하는 날짜" 기준 10거래일 뒤 future 생성
     for oil_col in ["Dubai", "Brent", "WTI"]:
         current_col = f"current_{oil_col}"
         future_col = f"future_{oil_col}"
+        oil_target_date_col = f"target_date_{oil_col}"
 
-        result[future_col] = result[current_col].shift(-FORECAST_HORIZON_TRADING_DAYS)
+        valid = result[["date", current_col]].dropna(subset=[current_col]).copy()
+        valid = valid.sort_values("date").reset_index(drop=True)
 
-    # 5. target date 생성
-    result[TARGET_DATE_COL] = result["date"].shift(-FORECAST_HORIZON_TRADING_DAYS)
-    result[TARGET_DATE_COL] = clean_date(result[TARGET_DATE_COL])
+        valid[future_col] = valid[current_col].shift(-FORECAST_HORIZON_TRADING_DAYS)
+        valid[oil_target_date_col] = valid["date"].shift(-FORECAST_HORIZON_TRADING_DAYS)
+        valid[oil_target_date_col] = clean_date(valid[oil_target_date_col])
+
+        result = result.merge(
+            valid[["date", future_col, oil_target_date_col]],
+            on="date",
+            how="left",
+        )
+
+        print(
+            f"[{oil_col}] 가격 존재 행 수:",
+            len(valid),
+            "| future 결측:",
+            valid[future_col].isna().sum(),
+        )
 
     print("\n[원유 가격 정리 완료]")
     print("전체 행 수:", before_rows)
     print("날짜 파싱 후 행 수:", after_date_rows)
-    print("가격 결측 제거 전/후 행 수:", before_price_rows, "->", after_price_rows)
     print(result.head().to_string(index=False))
     print(result.tail().to_string(index=False))
     print("크기:", result.shape)
     print("날짜 범위:", result["date"].min(), "~", result["date"].max())
     print("결측치:")
-    print(result.isna().sum().sort_values(ascending=False).head(20))
+    print(result.isna().sum().sort_values(ascending=False).head(30))
 
     return result
 
@@ -570,7 +571,6 @@ def add_gdelt_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
     base_cols = [col for col in df.columns if col.startswith("gdelt_")]
-
     new_features = {}
 
     for col in base_cols:
@@ -773,7 +773,6 @@ def add_spread_features(df: pd.DataFrame) -> pd.DataFrame:
     new_features["Brent_to_WTI_ratio"] = df["current_Brent"] / (df["current_WTI"] + eps)
 
     spread_base = pd.DataFrame(new_features, index=df.index)
-
     spread_features = {}
 
     for col in spread_base.columns:
@@ -839,7 +838,9 @@ def add_price_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def merge_asof_feature(
-    base_df: pd.DataFrame, feature_df: pd.DataFrame, name: str
+    base_df: pd.DataFrame,
+    feature_df: pd.DataFrame,
+    name: str,
 ) -> pd.DataFrame:
     base = base_df.copy()
     feat = feature_df.copy()
@@ -923,23 +924,50 @@ def make_oil_dataset(all_df: pd.DataFrame, oil_type: str) -> pd.DataFrame:
 
     current_col = f"current_{oil_name}"
     future_col = f"future_{oil_name}"
+    oil_target_date_col = f"target_date_{oil_name}"
 
-    if current_col not in all_df.columns or future_col not in all_df.columns:
-        raise ValueError(
-            f"{oil_type}용 가격 컬럼이 없습니다: {current_col}, {future_col}"
-        )
+    required_cols = [current_col, future_col, oil_target_date_col]
+
+    missing = [col for col in required_cols if col not in all_df.columns]
+    if missing:
+        raise ValueError(f"{oil_type}용 필수 컬럼이 없습니다: {missing}")
 
     df = all_df.copy()
+
+    df[TARGET_DATE_COL] = df[oil_target_date_col]
     df[TARGET_COL] = df[future_col] - df[current_col]
 
     before_rows = len(df)
 
-    # 학습에 필수인 값이 없는 행만 삭제
-    df = df.dropna(subset=[current_col, future_col, TARGET_COL, TARGET_DATE_COL]).copy()
+    # 1. 해당 유종 기준 target 생성에 필요한 값 제거
+    df = df.dropna(
+        subset=[
+            current_col,
+            future_col,
+            TARGET_COL,
+            TARGET_DATE_COL,
+        ]
+    ).copy()
 
-    after_rows = len(df)
+    after_target_rows = len(df)
 
-    drop_cols = [col for col in df.columns if col.startswith("future_")]
+    # 2. cross-oil feature를 사용하기 위해 현재 세 유종 가격이 모두 있는 행만 유지
+    # target은 이미 각 유종별 정확한 10거래일 기준으로 생성된 상태
+    cross_price_cols = [
+        "current_Dubai",
+        "current_Brent",
+        "current_WTI",
+    ]
+
+    before_cross_price_rows = len(df)
+    df = df.dropna(subset=cross_price_cols).copy()
+    after_cross_price_rows = len(df)
+
+    drop_cols = [
+        col
+        for col in df.columns
+        if col.startswith("future_") or col.startswith("target_date_")
+    ]
 
     df = df.drop(columns=drop_cols)
     df = df.sort_values("date").reset_index(drop=True)
@@ -953,7 +981,15 @@ def make_oil_dataset(all_df: pd.DataFrame, oil_type: str) -> pd.DataFrame:
     print("경로:", output_path)
     print("크기:", df.shape)
     print("target:", f"{future_col} - {current_col}")
-    print("필수값 기준 삭제 전/후 행 수:", before_rows, "->", after_rows)
+    print("target_date:", oil_target_date_col, "->", TARGET_DATE_COL)
+    print("전체 행 수:", before_rows)
+    print("target 필수값 제거 전/후:", before_rows, "->", after_target_rows)
+    print(
+        "cross-oil 현재 가격 결측 제거 전/후:",
+        before_cross_price_rows,
+        "->",
+        after_cross_price_rows,
+    )
     print("날짜 범위:", df["date"].min(), "~", df["date"].max())
     print("target 결측치:", df[TARGET_COL].isna().sum())
     print("target 통계:")
