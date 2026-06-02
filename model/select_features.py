@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -16,12 +15,12 @@ from sklearn.preprocessing import StandardScaler
 from config import (
     CURRENT_PRICE_COLUMNS,
     DATASET_PATHS,
-    EXPERIMENT_DIR,
     FEATURE_SCORE_PATH,
     PRIMARY_OIL_TYPE,
-    SELECTED_FEATURES_PATH,
     SELECTED_EXTRA_TOP_K_LIST,
+    SELECTED_FEATURES_PATH,
     TARGET_COL,
+    TRAIN_RATIO,
     ensure_directories,
 )
 
@@ -53,10 +52,10 @@ def remove_leak_features(features: list[str]) -> list[str]:
     result = []
 
     for col in features:
-        if any(keyword in col for keyword in leak_keywords):
+        if col == "date":
             continue
 
-        if col in ["date"]:
+        if any(keyword in col for keyword in leak_keywords):
             continue
 
         result.append(col)
@@ -312,6 +311,7 @@ def main():
         raise FileNotFoundError(f"dataset이 없습니다: {dataset_path}")
 
     df = pd.read_csv(dataset_path)
+    df = df.sort_values("date").reset_index(drop=True)
 
     print("데이터 크기:", df.shape)
     print("날짜 범위:", df["date"].min(), "~", df["date"].max())
@@ -332,7 +332,17 @@ def main():
     print("\nextra 후보 일부:")
     print(extra_candidates[:50])
 
-    score_df = score_features(df, extra_candidates)
+    # 핵심 수정:
+    # feature selection은 전체 데이터가 아니라 train 구간만 사용
+    train_end = int(len(df) * TRAIN_RATIO)
+    train_df = df.iloc[:train_end].copy()
+
+    print("\nfeature selection 기준:")
+    print("train rows:", len(train_df))
+    print("train date range:", train_df["date"].min(), "~", train_df["date"].max())
+    print("전체 데이터가 아니라 train 구간만 사용해서 extra feature 점수 계산")
+
+    score_df = score_features(train_df, extra_candidates)
 
     score_df.to_csv(FEATURE_SCORE_PATH, index=False, encoding="utf-8-sig")
 
@@ -341,6 +351,13 @@ def main():
         "base_feature_set": "price_momentum_gpr",
         "base_features": base_features,
         "extra_candidates_count": len(extra_candidates),
+        "feature_selection": {
+            "method": "train_only",
+            "train_ratio": TRAIN_RATIO,
+            "train_rows": int(len(train_df)),
+            "train_start": str(train_df["date"].min()),
+            "train_end": str(train_df["date"].max()),
+        },
         "selected_extra": {},
         "feature_sets": {},
     }
