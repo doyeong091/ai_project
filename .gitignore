@@ -22,7 +22,6 @@ env/
 data/raw/
 data/processed/
 data/collected_data/
-*.csv
 
 # Model files
 *.pkl
