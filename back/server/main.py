@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 
 try:
     from back.server.feature_builder import (
@@ -25,6 +28,7 @@ try:
         HealthResponse,
         ModelFeatureListResponse,
         ModelSummaryResponse,
+        PredictionPathResponse,
         SimulationOptionsResponse,
         SimulationPredictionResponse,
         SimulationRequest,
@@ -49,6 +53,7 @@ except ImportError:
         HealthResponse,
         ModelFeatureListResponse,
         ModelSummaryResponse,
+        PredictionPathResponse,
         SimulationOptionsResponse,
         SimulationPredictionResponse,
         SimulationRequest,
@@ -61,6 +66,27 @@ app = FastAPI(
     description="Dubai / WTI / Brent 10-trading-day oil price prediction API",
     version="1.0.0",
 )
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://127.0.0.1:8000",
+        "http://localhost:8000",
+        "http://127.0.0.1:5500",
+        "http://localhost:5500",
+        "null",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# =========================
+# Global settings
+# =========================
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 
 MODELS = None
 
@@ -76,7 +102,47 @@ DISPLAY_OIL_NAMES = {
     "brent": "Brent",
 }
 
+PROCESSED_DATASET_PATHS = {
+    "dubai": PROCESSED_DIR / "dubai_dataset.csv",
+    "wti": PROCESSED_DIR / "wti_dataset.csv",
+    "brent": PROCESSED_DIR / "brent_dataset.csv",
+}
+
 HORIZON_TRADING_DAYS = 10
+
+PATH_POINTS = [
+    {
+        "label": "현재",
+        "offset_trading_days": 0,
+        "source_row_offset": 0,
+        "use_live": True,
+    },
+    {
+        "label": "2일 뒤",
+        "offset_trading_days": 2,
+        "source_row_offset": -8,
+        "use_live": False,
+    },
+    {
+        "label": "5일 뒤",
+        "offset_trading_days": 5,
+        "source_row_offset": -5,
+        "use_live": False,
+    },
+    {
+        "label": "8일 뒤",
+        "offset_trading_days": 8,
+        "source_row_offset": -2,
+        "use_live": False,
+    },
+    {
+        "label": "10일 뒤(예측)",
+        "offset_trading_days": 10,
+        "source_row_offset": 0,
+        "use_live": True,
+    },
+]
+
 
 SIMULATION_OPTION_GROUPS = {
     "price": [
@@ -195,6 +261,9 @@ SIMULATION_OPTION_GROUPS = {
 }
 
 
+# =========================
+# Utility
+# =========================
 def get_models():
     global MODELS
 
@@ -220,6 +289,87 @@ def split_selected_features_by_model(
             ignored[key] = value
 
     return applied, ignored
+
+
+def clean_date_col(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.dropna(subset=["date"])
+        df = df.sort_values("date").reset_index(drop=True)
+
+    return df
+
+
+def row_to_feature_dict(row: pd.Series) -> dict:
+    result = {}
+
+    for key, value in row.to_dict().items():
+        if pd.isna(value):
+            result[key] = None
+        elif isinstance(value, pd.Timestamp):
+            result[key] = str(value.date())
+        elif isinstance(value, np.generic):
+            result[key] = value.item()
+        else:
+            result[key] = value
+
+    return result
+
+
+def get_requested_model_type(
+    requested_model_type: str | None,
+    selected_features: dict,
+) -> str:
+    if requested_model_type is not None:
+        requested_model_type = str(requested_model_type).strip().lower()
+
+    if requested_model_type in ["default", "shock_aware"]:
+        return requested_model_type
+
+    return route_model_type(selected_features)
+
+
+def load_processed_dataset(oil_type: str) -> pd.DataFrame:
+    oil = normalize_oil_type(oil_type)
+    path = PROCESSED_DATASET_PATHS[oil]
+
+    if not path.exists():
+        raise FileNotFoundError(f"processed dataset이 없습니다: {path}")
+
+    df = pd.read_csv(path)
+    df = clean_date_col(df)
+
+    if df.empty:
+        raise ValueError(f"processed dataset이 비어 있습니다: {path}")
+
+    return df
+
+
+def overlay_selected_features_for_path(
+    base_features: dict,
+    selected_features: dict,
+    current_col: str,
+    use_live: bool,
+) -> dict:
+    """
+    path 중간 지점은 과거 기준 row를 사용한다.
+    단, 사용자가 조정한 비가격 시나리오 변수는 반영할 수 있다.
+    현재 가격 컬럼은 live 지점에만 반영한다.
+    """
+    features = base_features.copy()
+
+    for key, value in selected_features.items():
+        if not use_live and key in CURRENT_PRICE_COLUMNS.values():
+            continue
+
+        features[key] = value
+
+    if current_col not in features or features[current_col] is None:
+        raise ValueError(f"path feature에 현재 가격 컬럼이 없습니다: {current_col}")
+
+    return features
 
 
 def predict_with_bundle(
@@ -267,6 +417,95 @@ def predict_with_bundle(
     }
 
 
+def build_prediction_path(
+    oil_type: str,
+    model_type: str,
+    selected_features: dict,
+) -> dict:
+    oil = normalize_oil_type(oil_type)
+    current_col = CURRENT_PRICE_COLUMNS[oil]
+
+    defaults = load_default_features()
+    processed_df = load_processed_dataset(oil)
+
+    path = []
+
+    for point in PATH_POINTS:
+        label = point["label"]
+        offset_trading_days = point["offset_trading_days"]
+        source_row_offset = point["source_row_offset"]
+        use_live = point["use_live"]
+
+        if offset_trading_days == 0:
+            source_date = defaults.get("date")
+            current_price = float(defaults[current_col])
+
+            path.append(
+                {
+                    "label": label,
+                    "offset_trading_days": offset_trading_days,
+                    "source_row_offset": source_row_offset,
+                    "source_date": (
+                        str(source_date) if source_date is not None else None
+                    ),
+                    "current_price": current_price,
+                    "predicted_return_pct": 0.0,
+                    "predicted_price": current_price,
+                }
+            )
+
+            continue
+
+        if use_live:
+            source_features = defaults.copy()
+            source_date = defaults.get("date")
+        else:
+            if len(processed_df) < abs(source_row_offset):
+                raise ValueError(
+                    f"{oil} path 생성을 위한 processed row가 부족합니다. "
+                    f"필요 offset={source_row_offset}, rows={len(processed_df)}"
+                )
+
+            source_row = processed_df.iloc[source_row_offset]
+            source_features = row_to_feature_dict(source_row)
+            source_date = source_features.get("date")
+
+        feature_values = overlay_selected_features_for_path(
+            base_features=source_features,
+            selected_features=selected_features,
+            current_col=current_col,
+            use_live=use_live,
+        )
+
+        result = predict_with_bundle(
+            oil_type=oil,
+            model_type=model_type,
+            feature_values=feature_values,
+        )
+
+        path.append(
+            {
+                "label": label,
+                "offset_trading_days": offset_trading_days,
+                "source_row_offset": source_row_offset,
+                "source_date": str(source_date) if source_date is not None else None,
+                "current_price": float(result["current_price"]),
+                "predicted_return_pct": float(result["predicted_return_pct"]),
+                "predicted_price": float(result["predicted_price_10d"]),
+            }
+        )
+
+    return {
+        "oil_type": DISPLAY_OIL_NAMES[oil],
+        "model_type": model_type,
+        "horizon_trading_days": HORIZON_TRADING_DAYS,
+        "path": path,
+    }
+
+
+# =========================
+# Routes
+# =========================
 @app.get("/api/health", response_model=HealthResponse)
 def health():
     return {"status": "ok"}
@@ -318,6 +557,20 @@ def default_features():
         "feature_count": len(defaults),
         "features": sorted(defaults.keys()),
     }
+
+
+@app.get("/api/default-feature-values")
+def default_feature_values():
+    try:
+        defaults = load_default_features()
+
+        return {
+            "feature_count": len(defaults),
+            "features": defaults,
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get(
@@ -427,7 +680,10 @@ def predict_simulation(request: SimulationRequest):
             selected_features=selected_features,
         )
 
-        model_type = route_model_type(selected_features)
+        model_type = get_requested_model_type(
+            requested_model_type=request.model_type,
+            selected_features=selected_features,
+        )
 
         models = get_models()
         bundle = get_model_bundle(
@@ -458,6 +714,30 @@ def predict_simulation(request: SimulationRequest):
             "applied_selected_features": applied_selected_features,
             "ignored_selected_features": ignored_selected_features,
         }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post(
+    "/api/predict/path",
+    response_model=PredictionPathResponse,
+)
+def predict_path(request: SimulationRequest):
+    try:
+        oil = normalize_oil_type(request.oil_type)
+        selected_features = request.selected_features or {}
+
+        model_type = get_requested_model_type(
+            requested_model_type=request.model_type,
+            selected_features=selected_features,
+        )
+
+        return build_prediction_path(
+            oil_type=oil,
+            model_type=model_type,
+            selected_features=selected_features,
+        )
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
