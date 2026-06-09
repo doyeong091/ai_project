@@ -22,6 +22,11 @@ class StatusResponse(BaseModel):
 class SimulationRequest(BaseModel):
     oil_type: str = Field(..., examples=["Dubai", "WTI", "Brent"])
     selected_features: dict[str, Any] = Field(default_factory=dict)
+    model_type: str | None = Field(
+        default=None,
+        examples=["default", "shock_aware"],
+        description="고급 옵션에서 명시적으로 사용할 모델 타입. 없으면 자동 라우팅.",
+    )
 
 
 class SinglePrediction(BaseModel):
@@ -76,3 +81,20 @@ class SimulationOptionItem(BaseModel):
 
 class SimulationOptionsResponse(BaseModel):
     categories: dict[str, list[SimulationOptionItem]]
+
+
+class PathPoint(BaseModel):
+    label: str
+    offset_trading_days: int
+    source_row_offset: int
+    source_date: str | None = None
+    current_price: float
+    predicted_return_pct: float
+    predicted_price: float
+
+
+class PredictionPathResponse(BaseModel):
+    oil_type: str
+    model_type: str
+    horizon_trading_days: int
+    path: list[PathPoint]

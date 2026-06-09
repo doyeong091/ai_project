@@ -32,15 +32,38 @@ def is_shock_related_feature(feature_name: str) -> bool:
     return any(keyword in normalized for keyword in SHOCK_KEYWORDS)
 
 
+def is_meaningful_value(value: Any) -> bool:
+    """
+    shock feature가 존재하더라도 값이 0, None, 빈 문자열이면
+    실제 shock 입력으로 보지 않는다.
+    """
+    if value is None:
+        return False
+
+    if isinstance(value, str):
+        value = value.strip()
+
+        if value == "":
+            return False
+
+    try:
+        numeric_value = float(value)
+
+        return abs(numeric_value) > 1e-9
+
+    except Exception:
+        return True
+
+
 def should_use_shock_aware_model(selected_features: dict[str, Any] | None) -> bool:
     if not selected_features:
         return False
 
     for feature_name, value in selected_features.items():
-        if value is None:
+        if not is_shock_related_feature(feature_name):
             continue
 
-        if is_shock_related_feature(feature_name):
+        if is_meaningful_value(value):
             return True
 
     return False
@@ -51,6 +74,3 @@ def route_model_type(selected_features: dict[str, Any] | None) -> str:
         return "shock_aware"
 
     return "default"
-
-
-ㄴ
