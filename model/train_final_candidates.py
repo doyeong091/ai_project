@@ -39,7 +39,7 @@ MODEL_MODES = {
         "train_cutoff": "2024-12-31",
         "test_start": "2025-01-01",
         "test_end": "2025-12-31",
-        "selection_metric": "price_mae",
+        "selection_metric": "return_mae",
     },
     "shock_aware": {
         "train_cutoff": "2026-03-31",
@@ -685,15 +685,15 @@ def main():
             if model_mode == "default":
                 group = group.sort_values(
                     [
-                        "price_mae",
-                        "normal_mae",
-                        "median_abs_error",
+                        "return_mae",
                         "max_abs_error",
+                        "price_mae",
+                        "median_abs_error",
                     ],
                     ascending=[True, True, True, True],
                 )
 
-                metric_name = "price_mae"
+                metric_name = "return_mae"
 
             else:
                 group = group.sort_values(

@@ -273,24 +273,6 @@ def get_models():
     return MODELS
 
 
-def split_selected_features_by_model(
-    selected_features: dict,
-    feature_cols: list[str],
-) -> tuple[dict, dict]:
-    applied = {}
-    ignored = {}
-
-    feature_col_set = set(feature_cols)
-
-    for key, value in selected_features.items():
-        if key in feature_col_set:
-            applied[key] = value
-        else:
-            ignored[key] = value
-
-    return applied, ignored
-
-
 def clean_date_col(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
@@ -345,6 +327,92 @@ def load_processed_dataset(oil_type: str) -> pd.DataFrame:
         raise ValueError(f"processed dataset이 비어 있습니다: {path}")
 
     return df
+
+
+def find_related_feature_cols(
+    base_key: str,
+    feature_cols: list[str],
+) -> list[str]:
+    base = str(base_key).strip().lower()
+
+    related = []
+
+    for col in feature_cols:
+        col_lower = str(col).strip().lower()
+
+        if col_lower == base:
+            related.append(col)
+            continue
+
+        if col_lower.startswith(f"{base}_"):
+            related.append(col)
+            continue
+
+        if f"_{base}_" in col_lower:
+            related.append(col)
+            continue
+
+        if base in col_lower:
+            related.append(col)
+            continue
+
+    return related
+
+
+def apply_derived_feature_adjustments(
+    default_features: dict,
+    selected_features: dict,
+    feature_cols: list[str],
+) -> tuple[dict, dict, dict]:
+    """
+    사용자가 DXY, VIX 같은 원본 feature를 변경했을 때,
+    모델이 직접 DXY/VIX를 쓰지 않고 DXY_rolling, VIX_lag 같은 파생 feature를 쓰는 경우를 보정한다.
+
+    정확한 rolling 재계산은 아니고,
+    관련 파생 feature에 원본값의 변화량(delta)을 반영하는 시뮬레이션용 보정이다.
+    """
+    feature_values = default_features.copy()
+    applied = {}
+    ignored = {}
+
+    for key, new_value in selected_features.items():
+        related_cols = find_related_feature_cols(
+            base_key=key,
+            feature_cols=feature_cols,
+        )
+
+        if not related_cols:
+            ignored[key] = new_value
+            continue
+
+        applied[key] = new_value
+
+        old_value = default_features.get(key)
+
+        try:
+            new_numeric = float(new_value)
+            old_numeric = float(old_value)
+            delta = new_numeric - old_numeric
+        except Exception:
+            delta = None
+
+        for col in related_cols:
+            if col == key:
+                feature_values[col] = new_value
+                continue
+
+            if delta is not None:
+                try:
+                    base_col_value = float(default_features.get(col, 0))
+                    feature_values[col] = base_col_value + delta
+                except Exception:
+                    feature_values[col] = default_features.get(col)
+            else:
+                feature_values[col] = default_features.get(col)
+
+        feature_values[key] = new_value
+
+    return feature_values, applied, ignored
 
 
 def overlay_selected_features_for_path(
@@ -428,6 +496,14 @@ def build_prediction_path(
     defaults = load_default_features()
     processed_df = load_processed_dataset(oil)
 
+    models = get_models()
+    bundle = get_model_bundle(
+        models=models,
+        oil_type=oil,
+        model_type=model_type,
+    )
+    feature_cols = bundle["feature_cols"]
+
     path = []
 
     for point in PATH_POINTS:
@@ -475,6 +551,12 @@ def build_prediction_path(
             selected_features=selected_features,
             current_col=current_col,
             use_live=use_live,
+        )
+
+        feature_values, _, _ = apply_derived_feature_adjustments(
+            default_features=feature_values,
+            selected_features=selected_features,
+            feature_cols=feature_cols,
         )
 
         result = predict_with_bundle(
@@ -672,13 +754,7 @@ def predict_simulation(request: SimulationRequest):
         oil = normalize_oil_type(request.oil_type)
 
         defaults = load_default_features()
-
         selected_features = request.selected_features or {}
-
-        feature_values = merge_user_features(
-            default_features=defaults,
-            selected_features=selected_features,
-        )
 
         model_type = get_requested_model_type(
             requested_model_type=request.model_type,
@@ -694,8 +770,9 @@ def predict_simulation(request: SimulationRequest):
 
         feature_cols = bundle["feature_cols"]
 
-        applied_selected_features, ignored_selected_features = (
-            split_selected_features_by_model(
+        feature_values, applied_selected_features, ignored_selected_features = (
+            apply_derived_feature_adjustments(
+                default_features=defaults,
                 selected_features=selected_features,
                 feature_cols=feature_cols,
             )

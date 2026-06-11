@@ -32,7 +32,7 @@ FINAL_MODEL_SOURCES = {
     ),
     "brent_default_model.pkl": (
         "final_candidates/"
-        "brent_default_price_momentum_gpr_selected_extra_10_xgboost_shallow.pkl"
+        "brent_default_price_momentum_gpr_region_conflict_gdelt_xgboost.pkl"
     ),
     "brent_shock_aware_model.pkl": (
         "final_candidates/"
